@@ -1,0 +1,547 @@
+================================================================================
+  WK 2026 BET-SIMULATIE PROJECT - PROJECTNOTITIES
+================================================================================
+
+Laatst bijgewerkt: 2026-05-28
+
+
+--------------------------------------------------------------------------------
+0. SAMENVATTING IN EEN ZIN
+--------------------------------------------------------------------------------
+
+Een volledig hands-off Python-script dat elke 6 uur draait via GitHub Actions,
+odds voor WK 2026 wedstrijden ophaalt bij The Odds API, odds-bewegingen
+analyseert, virtuele bets plaatst volgens een sharp/publiek-strategie met
+quarter Kelly sizing, automatisch wedstrijden afwikkelt en alles rapporteert
+via GitHub Issues.
+
+
+
+--------------------------------------------------------------------------------
+1. PROJECTDOEL
+--------------------------------------------------------------------------------
+
+Hobby-experiment: kan een betting-strategie gebaseerd op odds-beweging +
+timing theoretisch winstgevend zijn op WK 2026 wedstrijden?
+
+Beperkingen die we voor onszelf hebben opgelegd:
+  - Alleen 1X2 / WDL op 90 minuten (drie uitkomsten: thuis, gelijkspel, uit).
+  - GEEN echt geld; bets zijn virtueel.
+  - Geen actieve betrokkenheid: het systeem draait, beslist en rapporteert
+    zelfstandig. De gebruiker checkt enkel de GitHub Issues / stats.
+
+
+
+--------------------------------------------------------------------------------
+2. STRATEGIE
+--------------------------------------------------------------------------------
+
+Per scrape (elke 6 uur) berekenen we voor elke aankomende wedstrijd de
+mediaan-odd over alle beschikbare bookmakers per uitkomst, en daarmee de
+mediaan-implied-probability. Op deze geaggregeerde tijdreeks zoeken we
+twee soorten signalen:
+
+  (A) VROEG SHARP SIGNAAL
+      Voorwaarde: in de fase TOT 48 uur voor aftrap is de implied
+      probability van een uitkomst met >= 6%-punt OMHOOG bewogen.
+      Interpretatie: sharps (professionele wedders) duwen deze lijn.
+      Actie: bet op die uitkomst (meebewegen met de scherpe markt).
+
+  (B) LAAT PUBLIEK SIGNAAL
+      Voorwaarde: in de laatste 6 uur voor aftrap is de implied
+      probability van een uitkomst met >= 6%-punt OMLAAG bewogen.
+      Interpretatie: het publiek koopt de "andere kant" en duwt
+      de prijs op deze uitkomst weg.
+      Actie: bet op die uitkomst (fade het publiek).
+
+Drempels en venster zijn allemaal configureerbaar via env-vars
+(zie sectie 8 "Configuratie").
+
+
+2.1  Bet-sizing - quarter Kelly
+-------------------------------
+
+Voor elk signaal schatten we de "echte" win-probability als:
+
+   p_hat = min( implied_prob + |beweging| * confidence * 0.3 , 0.95 )
+
+waarbij confidence = min(|beweging| / drempel, 2.0). Dat wil zeggen:
+hoe groter de beweging t.o.v. de drempel, hoe meer we geloven in een
+edge - tot maximaal 2x de drempel.
+
+Kelly fractie:    f* = (p_hat * b - q) / b   waarbij b = odd - 1
+Inzet:            stake = bankroll * f* * 0.25
+Cap:              nooit > 5% van bankroll per bet (MAX_BET_FRACTIE)
+
+We staken zowel tegen de "compound" bankroll (start EUR 100, groeit/krimpt
+met resultaten) als tegen een vaste EUR 100 referentie. Beide getallen
+worden per bet en in de stats apart bijgehouden, zodat je het effect van
+compounding kunt vergelijken.
+
+
+2.2  Re-bet regels
+------------------
+
+Re-bets ("middelen" op dezelfde edge als de beweging doorzet):
+
+  - Per (wedstrijd, uitkomst): max 2 bets (1 initial + 1 re-bet).
+  - Per wedstrijd: ALLEEN op die ene uitkomst waarop al een bet ligt.
+    We staan dus geen tegengestelde bets op dezelfde wedstrijd toe.
+  - Re-bet voorwaarde: huidige |beweging| >= 12% (re-bet drempel) EN
+    dezelfde richting als de oorspronkelijke beweging.
+  - Re-bet-stake gebruikt actuele bankroll en huidige odd op moment
+    van triggeren (de odd wordt opnieuw "gelocked").
+
+
+
+--------------------------------------------------------------------------------
+3. BESTANDSSTRUCTUUR
+--------------------------------------------------------------------------------
+
+  gok_projectje/
+  +-- wk2026_tracker.py         <-- alle logica (single-file)
+  +-- requirements.txt          <-- `requests`
+  +-- .gitignore                <-- ignoreert .env, lokale db, __pycache__
+  +-- .env.example              <-- template voor lokale env vars
+  +-- projectnotes.txt          <-- DIT bestand
+  +-- claude_code_prompt.md     <-- originele opdracht aan Claude (historie)
+  +-- .github/
+       +-- workflows/
+            +-- scrape.yml      <-- GitHub Actions cron + push job
+
+Productie:
+  - Branch `main`          - alleen code (de bestanden hierboven).
+  - Branch `data`          - bevat ALLEEN `wk2026.db`. Wordt elke
+                             cyclus overschreven door de Actions runner.
+
+
+
+--------------------------------------------------------------------------------
+4. ARCHITECTUUR / DATA-FLOW
+--------------------------------------------------------------------------------
+
+Eens per 6 uur triggert GitHub Actions de volgende keten:
+
+   GitHub Actions cron
+            |
+            v
+   [job: checkout main code]
+            |
+            v
+   [restore wk2026.db vanaf branch `data`]
+            |
+            v
+   python wk2026_tracker.py daily-run
+            |
+            +-- 1. haal_odds_op()              (The Odds API /odds)
+            |        => 2 credits (eu + uk)
+            |
+            +-- 2. sla_odds_snapshot_op()      (per-bookmaker rauw)
+            +-- 3. sla_aggregated_snapshot_op()(mediaan + gemiddelde)
+            |
+            +-- 4. plaats_bets_voor_scrape()
+            |        - detecteer_signalen_voor_wedstrijd()
+            |        - check re-bet regels
+            |        - kelly_inzet(compound) + kelly_inzet(vast EUR 100)
+            |        - INSERT in bets-tabel
+            |
+            +-- 5. notificeer_nieuwe_bets()    (GitHub Issues)
+            |
+            +-- 6. settle_voltooide_wedstrijden()
+            |        - skip /scores call als geen open bets klaar zijn
+            |        - anders: haal_scores_op() (~1-2 credits)
+            |        - UPDATE bets met resultaat + payout + pnl
+            |
+            +-- 7. notificeer_settled_bets()   (GitHub Issues close)
+            |
+            v
+   [push wk2026.db terug naar branch `data`]
+
+
+
+--------------------------------------------------------------------------------
+5. DATABASE-SCHEMA (SQLite, file: wk2026.db)
+--------------------------------------------------------------------------------
+
+  wedstrijden            <-- één rij per match
+    id              TEXT  PK  (Odds-API event ID)
+    thuisteam       TEXT
+    uitteam         TEXT
+    aanvang         TEXT  (ISO timestamp UTC)
+    voltooid        INT   (0/1, 1 zodra /scores zegt completed=true)
+    thuis_score     INT
+    uit_score       INT
+    winnaar         TEXT  ('thuis'/'gelijkspel'/'uit')
+    afgewikkeld_op  TEXT
+    gh_issue_number INT   (GitHub Issue nummer voor deze match)
+
+  odds_snapshots         <-- één rij per (scrape, bookmaker, uitkomst)
+    id              INT PK
+    wedstrijd_id    TEXT FK
+    bookmaker       TEXT  (bv 'pinnacle', 'bet365', 'unibet')
+    uitkomst        TEXT  ('thuis'/'gelijkspel'/'uit')
+    odd             REAL  (decimal odd, bv 2.45)
+    implied_prob    REAL  (1/odd, bv 0.4082)
+    timestamp       TEXT  (ISO UTC; gelijk binnen één scrape)
+
+  aggregated_snapshots   <-- één rij per (scrape, uitkomst) per match
+    id              INT PK
+    wedstrijd_id    TEXT FK
+    uitkomst        TEXT
+    median_odd      REAL  (mediaan over bookmakers)
+    mean_odd        REAL  (gemiddelde over bookmakers)
+    n_bookmakers    INT   (aantal samples in deze aggregatie)
+    implied_prob    REAL  (1 / median_odd; gebruikt voor signalen)
+    timestamp       TEXT
+
+  bets                   <-- alle (virtuele) bets
+    id                       INT PK
+    wedstrijd_id             TEXT FK
+    uitkomst                 TEXT
+    signaal_type             TEXT  ('vroeg_sharp' / 'laat_publiek')
+    beweging_prob            REAL  (de Delta die het signaal triggerde)
+    locked_odd               REAL  (aggregated median odd op bet-moment)
+    is_rebet                 INT   (0 of 1)
+    stake_compound           REAL  (Kelly op compound bankroll)
+    stake_fixed              REAL  (Kelly op vaste EUR 100 referentie)
+    bankroll_compound_at_bet REAL  (snapshot voor traceability)
+    payout_compound          REAL  (NULL tot settled)
+    payout_fixed             REAL  (NULL tot settled)
+    pnl_compound             REAL  (payout - stake)
+    pnl_fixed                REAL
+    resultaat                TEXT  ('gewonnen'/'verloren', NULL = open)
+    geplaatst_op             TEXT
+    afgewikkeld_op           TEXT
+
+  api_runs               <-- audit log voor API gebruik
+    id              INT PK
+    timestamp       TEXT
+    endpoint        TEXT  ('odds' / 'scores')
+    credits_used    INT   (van header x-requests-used)
+    credits_remaining INT (van header x-requests-remaining)
+    status          TEXT  ('ok' / error message)
+
+
+
+--------------------------------------------------------------------------------
+6. CLI COMMANDO'S
+--------------------------------------------------------------------------------
+
+  python wk2026_tracker.py daily-run
+      Volledige cyclus: scrape + aggregate + beslis + settle + notify.
+      Dit is wat GitHub Actions elke 6 uur draait.
+
+  python wk2026_tracker.py scrape
+      Alleen odds ophalen, ruw + aggregaat opslaan. Geen bets/notify.
+
+  python wk2026_tracker.py signalen
+      Toon alle huidige signalen voor aankomende wedstrijden (read-only).
+      Handig om de strategie-output te bekijken zonder bets te plaatsen.
+
+  python wk2026_tracker.py beslis
+      Plaats virtuele bets op basis van actuele signalen + notificeer.
+      Equivalent aan stappen 4-5 van daily-run.
+
+  python wk2026_tracker.py settle
+      Haal /scores op, wikkel open bets af, notificeer + sluit issues.
+
+  python wk2026_tracker.py stats
+      Toon totaal stake/payout/P&L/ROI/win-rate/drawdown, beide bankroll
+      modellen naast elkaar.
+
+  python wk2026_tracker.py bankroll
+      Toon huidige compound (totaal + beschikbaar) en vaste bankroll.
+
+  python wk2026_tracker.py bets
+      Lijst van alle bets (open en gesettled) met kerngegevens.
+
+  python wk2026_tracker.py wedstrijden
+      Lijst van aankomende wedstrijden uit de DB.
+
+
+
+--------------------------------------------------------------------------------
+7. GITHUB SETUP - STAPPENPLAN
+--------------------------------------------------------------------------------
+
+  STAP 1. Maak een GitHub repo (private of public, beide werken).
+
+  STAP 2. Initialiseer git lokaal en push:
+            cd C:\Users\31631\Documents\gok_projectje
+            git init -b main
+            git add wk2026_tracker.py requirements.txt .gitignore .env.example projectnotes.txt
+            git add .github/workflows/scrape.yml
+            git commit -m "Initial WK2026 tracker"
+            git remote add origin https://github.com/<jouw-user>/<repo>.git
+            git push -u origin main
+
+          BELANGRIJK: commit GEEN .env, GEEN wk2026.db lokaal. De
+          .gitignore weert dit, maar check je staging area altijd even.
+
+  STAP 3. Voeg de Odds API key toe als repository secret:
+            Settings -> Secrets and variables -> Actions -> "New repository secret"
+            Naam:  ODDS_API_KEY
+            Value: <jouw key van the-odds-api.com>
+
+          De Actions workflow gebruikt automatisch ${{ secrets.GITHUB_TOKEN }}
+          voor Issues; daar hoef je niets voor te doen.
+
+  STAP 4. (BELANGRIJK / VEILIGHEID)
+          Je oude wk2026_tracker.py had een hardcoded API key in de
+          source. Die is verwijderd in de nieuwe versie. ALS die key
+          ooit in een eerdere git history zit en je het project public
+          maakt: rotate hem direct op https://the-odds-api.com.
+
+  STAP 5. Eerste test: trigger handmatig vanuit de UI:
+            Actions tab -> "WK 2026 Bet Cycle" -> "Run workflow"
+          De eerste run maakt de `data` branch aan, pakt openings-odds,
+          en plaatst (waarschijnlijk) nog geen bets - er is nog geen
+          beweging om mee te vergelijken. Issues volgen vanaf de
+          tweede of derde scrape.
+
+  STAP 6. Bekijk de uitvoer:
+            - Actions tab voor live logs van elke run.
+            - Issues tab voor bet-meldingen (één issue per wedstrijd
+              waarop een bet is geplaatst, met comments voor re-bets
+              en het settle-resultaat).
+            - Branch `data` voor de actuele wk2026.db (download via
+              de GitHub UI of `git fetch origin data && git checkout
+              data -- wk2026.db` lokaal).
+
+
+
+--------------------------------------------------------------------------------
+8. CONFIGURATIE (env vars)
+--------------------------------------------------------------------------------
+
+  Lokaal: zet in .env (zie .env.example).
+  In Actions: alleen ODDS_API_KEY is verplicht; de rest neemt
+  defaults uit `wk2026_tracker.py`. Andere instellingen kun je
+  overschrijven door ze toe te voegen aan de `env:` block van
+  het `daily-run` step in `.github/workflows/scrape.yml`.
+
+  Variabele                  Default                       Wat het doet
+  -------------------------  ----------------------------  -------------------------
+  ODDS_API_KEY               (verplicht)                   API auth
+  WK2026_DB                  wk2026.db                     SQLite pad
+  WK2026_SPORT               soccer_fifa_world_cup         Odds-API sport key
+  WK2026_REGIO               eu,uk                         Welke bookmaker-regio's
+  WK2026_STARTBANKROLL       100                           Start euro
+  WK2026_THRESHOLD           0.06                          Eerste signaal-drempel
+  WK2026_THRESHOLD_REBET     0.12                          Re-bet drempel
+  WK2026_VROEG_UUR           48                            Vroeg-venster grens
+  WK2026_LAAT_UUR            6                             Laat-venster grens
+  WK2026_KELLY_FRACTIE       0.25                          Quarter Kelly
+  WK2026_MAX_BET_FRACTIE     0.05                          5% max per bet
+  GH_TOKEN                   (auto in Actions)             Voor Issues
+  GH_REPO                    (auto in Actions)             owner/repo
+
+
+
+--------------------------------------------------------------------------------
+9. API BUDGET (The Odds API free tier = 500 credits/maand)
+--------------------------------------------------------------------------------
+
+  /odds endpoint
+      Kost = aantal_markets * aantal_regio's = 1 * 2 = 2 credits per call.
+      4 calls per dag * 30 dagen = 240 credits/maand.
+
+  /scores endpoint
+      Kost = 2 met daysFrom (we gebruiken daysFrom=3).
+      Smart-skip: we callen /scores ALLEEN als er een open bet is op een
+      wedstrijd die minstens 2 uur geleden is gestart. Tijdens de groepsfase
+      betekent dat hooguit 1-2 calls per dag - geschat ~60-120 credits/maand.
+
+  Totaal verwacht  : ~300-360 credits/maand. Ruime marge onder de 500.
+
+  Als je tegen het plafond aanloopt:
+    - Verlaag scrape-frequentie naar elke 8u of 12u (cron in scrape.yml).
+    - Beperk REGIO tot 'eu' (1 credit/odds-call -> 120/maand).
+    - Of upgrade naar betaald plan ($30/maand voor 20k credits).
+
+
+
+--------------------------------------------------------------------------------
+10. NOTIFICATIES (GitHub Issues)
+--------------------------------------------------------------------------------
+
+Eén issue per wedstrijd zodra de eerste bet wordt geplaatst:
+
+   Titel:     BET: Spain vs Brazil - thuis @ 2.45 (vroeg_sharp)
+   Labels:    bet, signal:vroeg_sharp, status:open
+   Body:      details over wedstrijd, signaal, stakes (compound + vast),
+              bankroll snapshot, bet-id.
+
+Re-bets verschijnen als comment op hetzelfde issue.
+
+Settle: wanneer de wedstrijd voltooid is, plaatst het systeem een
+afsluitende comment met eindstand, payouts, P&L op beide bankroll-
+modellen, en de actuele compound bankroll. Het issue wordt gesloten
+en gelabeld als `result:won`, `result:lost` of `result:mixed`
+(bij mix van win + verlies op re-bet).
+
+Filters:
+   open issues          = lopende posities
+   closed + result:won  = winnende afgeronde matches
+   closed + result:lost = verliezende afgeronde matches
+   label:rebet          = matches waar een re-bet is geplaatst
+
+
+
+--------------------------------------------------------------------------------
+11. LOKAAL TESTEN
+--------------------------------------------------------------------------------
+
+  cd C:\Users\31631\Documents\gok_projectje
+  py -m venv .venv
+  .venv\Scripts\activate
+  pip install -r requirements.txt
+  copy .env.example .env             (en vul ODDS_API_KEY in)
+
+  # Laad .env (PowerShell):
+  Get-Content .env | ForEach-Object { if ($_ -match '^([^#=]+)=(.*)$') { Set-Item -Path env:$($matches[1]) -Value $matches[2] } }
+
+  # Test commando's:
+  python wk2026_tracker.py wedstrijden       # nog leeg
+  python wk2026_tracker.py scrape            # haalt odds, slaat snapshots op
+  python wk2026_tracker.py signalen          # eerste run: weinig signaal (te weinig historie)
+  python wk2026_tracker.py daily-run         # full cyclus
+
+Lokale runs schrijven naar `wk2026.db` in de project-map. Die staat
+in `.gitignore` en wordt nooit gecommit. De Actions-runner werkt met
+zijn eigen kopie vanaf branch `data`.
+
+
+
+--------------------------------------------------------------------------------
+12. SUBTIELE PUNTEN / GOTCHAS
+--------------------------------------------------------------------------------
+
+12.1  Sport key voor WK 2026
+      Het script gebruikt 'soccer_fifa_world_cup'. The Odds API listt deze
+      key meestal pas zodra het toernooi nadert. Verifieer met:
+         GET https://api.the-odds-api.com/v4/sports?apiKey=<jouw_key>
+      en pas WK2026_SPORT aan als de key anders blijkt.
+
+12.2  Opening probability
+      Het script behandelt zijn EERSTE eigen waarneming als opening.
+      Echte opening odds (gepubliceerd weken eerder) zijn niet
+      beschikbaar via de free Odds-API. Het venster <=48u tot KO is
+      dus relatief, niet absoluut - werkt prima zolang we ruim van
+      tevoren beginnen met scrapen.
+
+12.3  /scores endpoint trefkans
+      The Odds API geeft scores door zodra de bookmakers ze verwerken.
+      Soms is dat al binnen 5 minuten na het laatste fluitsignaal, soms
+      duurt het 30-60 min. De smart-skip (>2u na aanvang) compenseert
+      hiervoor; in zeldzame gevallen kan een bet pas in een volgende
+      cyclus afgewikkeld worden. Dat is geen probleem.
+
+12.4  Race-conditions op de DB
+      `concurrency: wk2026-bet-cycle` in de workflow zorgt dat slechts
+      één run tegelijk draait. Daardoor kunnen twee runs niet
+      tegelijkertijd dezelfde DB-versie pakken en overschrijven.
+
+12.5  Quota uitgeput
+      Als de API een 429/401 teruggeeft, faalt de huidige cyclus stil
+      (try/except in daily-run logt het maar crasht niet). De DB
+      blijft consistent; volgende cyclus probeert opnieuw.
+
+12.6  Tijdzones
+      Alles wordt opgeslagen in UTC. `aanvang` is UTC. Conversie naar
+      lokale tijd doe je in de notificatie of bij stats; nu niet
+      ingebouwd om dingen simpel te houden.
+
+12.7  Tournament-strucruur (groep -> knockout)
+      De huidige strategie maakt geen onderscheid tussen groepsfase
+      en knockoutfase. In de knockout zit 90'/verlenging/penalty - wij
+      gokken puur op 90 minuten (driewegmarkt h2h). Een 1-1 in de
+      knockoutfase na 90 telt dus bij ons als `gelijkspel` ongeacht
+      wat er in extra time gebeurt - dat is precies hoe de h2h-markt
+      werkt bij de meeste boekmakers. Verifieer wel even op je eigen
+      provider's site voordat je echt geld zou gaan inzetten.
+
+
+
+--------------------------------------------------------------------------------
+13. WAT NOG NIET INGEBOUWD IS (mogelijke uitbreidingen)
+--------------------------------------------------------------------------------
+
+   - Backtesting (claude_code_prompt.md punt 2): een aparte
+     `backtest.py` die historische snapshots opnieuw door de
+     signaallogica haalt. Pas zinvol nadat we een paar weken data
+     hebben verzameld, of via de Odds-API historical endpoint
+     (kost wel extra credits per query).
+
+   - Weekly summary issue: nu krijgt elke wedstrijd zijn eigen issue.
+     Een extra "WEKELIJKSE SAMENVATTING #N" issue (open, met body die
+     elke maandag wordt geupdate) zou een mooie aanvulling zijn.
+
+   - Sharpe-ratio en variance metrics in `stats` (nu alleen ROI,
+     win-rate, drawdown).
+
+   - Slack / Telegram / email notificaties als alternatief voor
+     Issues (vereist extra secrets en infrastructuur, geskipt voor nu).
+
+   - Adaptieve drempels: i.p.v. een statische 6% / 12% drempel,
+     drempels die zich aanpassen aan de algemene volatiliteit
+     van de markt op dat moment.
+
+   - Liquiditeit / max-stake check: simulatie aanname is dat we
+     altijd `stake` kunnen plaatsen tegen `locked_odd` - in
+     realiteit kan een boekmaker je beperken bij grote bedragen.
+
+
+
+--------------------------------------------------------------------------------
+14. SNELLE TROUBLESHOOTING
+--------------------------------------------------------------------------------
+
+  Actions run faalt op "401 Unauthorized"
+      -> Check repo secrets: ODDS_API_KEY moet exact zo heten.
+
+  Geen wedstrijden in DB na scrape
+      -> Verifieer SPORT key (sectie 12.1). Soms heet de WC nog
+         'soccer_world_cup' of 'soccer_fifa_world_cup_2026'.
+
+  "Geen signalen" terwijl je beweging verwacht
+      -> Eerste 1-2 scrapes hebben per definitie nog geen
+         vergelijkings-historie. Wacht 1-2 cycli.
+      -> Check `WK2026_THRESHOLD`: 6% is best stevig. Tijdelijk
+         verlagen naar 0.04 om te zien of de logica vuurt.
+
+  Issue wordt niet aangemaakt
+      -> Check workflow `permissions: issues: write` aanwezig is.
+      -> Check `GH_REPO` env var: moet `owner/repo` formaat zijn.
+
+  DB lijkt leeg na nieuwe Actions run
+      -> Workflow doet `git ls-remote --exit-code --heads origin data`
+         voordat het probeert te restoren. Bij een geheel verse repo is
+         de eerste run normaal: nieuwe DB, eerste push naar `data`.
+
+  "fatal: refusing to merge unrelated histories" bij git pull origin data
+      -> Niet doen. De `data` branch is opzettelijk een orphan branch
+         zonder gemeenschappelijke history met `main`. Behandel hem
+         als pure storage, niet als mergebare branch.
+
+
+
+--------------------------------------------------------------------------------
+15. OPEN VRAGEN / KEUZES OM LATER OPNIEUW TE BEKIJKEN
+--------------------------------------------------------------------------------
+
+  - Threshold-tuning: nadat we ~30-50 settled bets hebben, kunnen we
+    in `stats` per signal_type kijken welk type beter scoort en de
+    drempels aanpassen. Mogelijk asymmetrisch (vroeg-drempel hoger
+    of lager dan laat-drempel).
+
+  - Kelly fractie: 0.25 is conservatief; bij overtuigend voordeel
+    kunnen we naar 0.5 (half Kelly). Bij twijfel: blijf op 0.25.
+
+  - Cross-wedstrijd correlatie (bv. zelfde land in twee wedstrijden):
+    nu niet gemodelleerd. Niet kritiek voor WK door beperkte aantal
+    matches per team in een korte tijd.
+
+================================================================================
+EINDE PROJECTNOTITIES
+================================================================================

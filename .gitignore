@@ -1,0 +1,29 @@
+# Secrets / lokale config
+.env
+.env.local
+*.key
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+env/
+
+# SQLite lokaal (de DB leeft op de `data` branch in productie,
+# nooit op `main`; lokaal testen kan een eigen kopie produceren)
+wk2026.db
+wk2026.db-journal
+*.sqlite
+*.sqlite3
+
+# Log files
+tracker.log
+*.log
+
+# OS / editor rommel
+.DS_Store
+Thumbs.db
+.idea/
+.vscode/

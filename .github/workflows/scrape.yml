@@ -1,0 +1,90 @@
+name: WK 2026 Bet Cycle
+
+# Draait elke 6 uur en kan handmatig vanuit de GitHub UI worden gestart.
+# Persistente data (wk2026.db) leeft op de `data` branch en wordt elke
+# run gerestored en weer teruggepusht.
+
+on:
+  schedule:
+    - cron: '0 */6 * * *'
+  workflow_dispatch:
+
+# Voorkom dat twee runs tegelijk op de DB schrijven.
+concurrency:
+  group: wk2026-bet-cycle
+  cancel-in-progress: false
+
+permissions:
+  contents: write
+  issues: write
+
+jobs:
+  cycle:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@v4
+
+      - name: Setup Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: '3.11'
+          cache: pip
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Restore DB from `data` branch
+        run: |
+          if git ls-remote --exit-code --heads origin data > /dev/null 2>&1; then
+            git fetch origin data --depth=1
+            git show origin/data:wk2026.db > wk2026.db 2> /dev/null \
+              && echo "DB hersteld vanaf data branch" \
+              || echo "Geen DB op data branch, start vers"
+          else
+            echo "Data branch bestaat nog niet, start vers"
+          fi
+
+      - name: Run daily-run cycle
+        env:
+          ODDS_API_KEY:  ${{ secrets.ODDS_API_KEY }}
+          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:       ${{ github.repository }}
+        run: python wk2026_tracker.py daily-run
+
+      - name: Push updated DB to `data` branch
+        if: always()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          if [ ! -f wk2026.db ]; then
+            echo "Geen DB om te pushen"
+            exit 0
+          fi
+
+          cp wk2026.db /tmp/wk2026.db
+          mkdir -p /tmp/data-branch
+          cd /tmp/data-branch
+
+          git init -q
+          git config user.email "actions@github.com"
+          git config user.name  "WK2026 Bot"
+          git remote add origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+
+          if git fetch origin data --depth=1 2> /dev/null; then
+            git checkout -B data FETCH_HEAD
+          else
+            git checkout --orphan data
+            git rm -rf . 2> /dev/null || true
+          fi
+
+          cp /tmp/wk2026.db ./wk2026.db
+          git add wk2026.db
+
+          if git diff --staged --quiet; then
+            echo "Geen DB-wijzigingen om te committen"
+          else
+            git commit -q -m "DB snapshot $(date -u +'%Y-%m-%d %H:%M UTC')"
+            git push -q origin data
+            echo "DB gepusht naar data branch"
+          fi
