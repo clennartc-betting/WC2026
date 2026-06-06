@@ -70,6 +70,30 @@ GH_TOKEN                 = os.environ.get("GH_TOKEN") or os.environ.get("GITHUB_
 GH_REPO                  = os.environ.get("GH_REPO")  or os.environ.get("GITHUB_REPOSITORY")
 NOTIFY_ENABLED           = bool(GH_TOKEN and GH_REPO)
 
+# Scrape-throttling: de workflow vuurt vaak (elke 2u) omdat GitHub cron
+# onbetrouwbaar is en runs overslaat. Het script bepaalt zelf of er
+# daadwerkelijk een API-call gedaan wordt, op basis van tijd sinds de
+# laatste scrape. Zo blijft het credit-verbruik begrensd ongeacht hoe
+# vaak de workflow draait.
+MIN_SCRAPE_GAP_HOURS       = float(os.environ.get("WK2026_MIN_SCRAPE_GAP_HOURS", "3.5"))
+# Vlak voor een aftrap willen we dichter op elkaar scrapen (zodat het
+# 'laat_publiek' signaal genoeg datapunten in de laatste uren heeft).
+SCRAPE_BOOST_WINDOW_HOURS  = float(os.environ.get("WK2026_SCRAPE_BOOST_WINDOW_HOURS", "6"))
+MIN_SCRAPE_GAP_BOOST_HOURS = float(os.environ.get("WK2026_MIN_SCRAPE_GAP_BOOST_HOURS", "1.5"))
+
+# Pre-match notificaties: stuur 1 alert per wedstrijd zodra de aftrap
+# binnen dit aantal uur valt. Ruim genomen zodat een overgeslagen run
+# de alert niet helemaal mist.
+PREMATCH_LEAD_HOURS        = float(os.environ.get("WK2026_PREMATCH_LEAD_HOURS", "3"))
+
+# Notificatiekanaal (CallMeBot WhatsApp, met optionele e-mail fallback).
+CALLMEBOT_PHONE   = os.environ.get("CALLMEBOT_PHONE")     # bv. +31612345678
+CALLMEBOT_APIKEY  = os.environ.get("CALLMEBOT_APIKEY")
+SMTP_USER         = os.environ.get("SMTP_USER")           # gmail adres
+SMTP_PASS         = os.environ.get("SMTP_PASS")           # gmail app password
+NOTIFY_EMAIL      = os.environ.get("NOTIFY_EMAIL")        # ontvanger
+NOTIFY_DRYRUN     = os.environ.get("WK2026_NOTIFY_DRYRUN", "").lower() in ("1", "true", "yes")
+
 
 # ── Klein helperblok ────────────────────────────────────────────────────────
 
@@ -203,6 +227,7 @@ def init_db(conn: sqlite3.Connection):
         "winnaar":         "TEXT",
         "afgewikkeld_op":  "TEXT",
         "gh_issue_number": "INTEGER",
+        "prematch_genotificeerd": "TEXT",
     }
     for col, decl in voor_migratie_wed.items():
         if col not in bestaande_wed:
@@ -960,9 +985,258 @@ def cmd_signalen(conn):
     print("\n" + "-" * 70 + "\n")
 
 
+# ── Scrape-throttling ───────────────────────────────────────────────────────
+
+def _laatste_scrape_tijd(conn) -> Optional[datetime]:
+    """Tijd van de meest recente succesvolle odds-scrape (uit api_runs)."""
+    row = conn.execute(
+        "SELECT MAX(timestamp) FROM api_runs WHERE endpoint = 'odds' AND status = 'ok'"
+    ).fetchone()
+    if row and row[0]:
+        try:
+            return _parse_iso(row[0])
+        except Exception:
+            return None
+    return None
+
+
+def _uur_tot_eerstvolgende_aftrap(conn) -> Optional[float]:
+    """Uren tot de eerstvolgende nog niet begonnen wedstrijd (None = geen)."""
+    now = datetime.now(timezone.utc)
+    rows = conn.execute("SELECT aanvang FROM wedstrijden WHERE voltooid = 0").fetchall()
+    toekomstig = []
+    for (aanvang,) in rows:
+        try:
+            dt = _parse_iso(aanvang)
+        except Exception:
+            continue
+        if dt > now:
+            toekomstig.append((dt - now).total_seconds() / 3600)
+    return min(toekomstig) if toekomstig else None
+
+
+def moet_scrapen(conn) -> tuple[bool, str]:
+    """
+    Bepaal of we nu daadwerkelijk de Odds API aanroepen. De workflow draait
+    vaak (elke 2u) omdat GitHub-cron runs overslaat; deze guard begrenst het
+    credit-verbruik en versnelt vlak voor een aftrap (boost-venster).
+    """
+    laatste = _laatste_scrape_tijd(conn)
+    if laatste is None:
+        return True, "eerste scrape"
+
+    uren_sinds = (datetime.now(timezone.utc) - laatste).total_seconds() / 3600
+    tot_aftrap = _uur_tot_eerstvolgende_aftrap(conn)
+
+    if tot_aftrap is not None and tot_aftrap <= SCRAPE_BOOST_WINDOW_HOURS:
+        gap, modus = MIN_SCRAPE_GAP_BOOST_HOURS, f"boost (aftrap over {tot_aftrap:.1f}u)"
+    else:
+        gap, modus = MIN_SCRAPE_GAP_HOURS, "normaal"
+
+    if uren_sinds >= gap:
+        return True, f"{modus}: {uren_sinds:.1f}u sinds laatste (>= {gap}u)"
+    return False, f"{modus}: pas {uren_sinds:.1f}u sinds laatste (< {gap}u) - overslaan"
+
+
+# ── Generieke notificaties (WhatsApp via CallMeBot / e-mail fallback) ────────
+
+def _send_callmebot(tekst: str) -> bool:
+    """Verstuur een WhatsApp-bericht via CallMeBot. False als niet ingesteld."""
+    if not (CALLMEBOT_PHONE and CALLMEBOT_APIKEY):
+        return False
+    try:
+        resp = requests.get(
+            "https://api.callmebot.com/whatsapp.php",
+            params={"phone": CALLMEBOT_PHONE, "text": tekst, "apikey": CALLMEBOT_APIKEY},
+            timeout=25,
+        )
+        if resp.status_code != 200:
+            log(f"[WA] CallMeBot status {resp.status_code}: {resp.text[:150]}")
+            return False
+        return True
+    except Exception as e:
+        log(f"[WA] CallMeBot fout: {e}")
+        return False
+
+
+def _send_email(titel: str, tekst: str) -> bool:
+    """Verstuur via Gmail SMTP. False als niet ingesteld."""
+    if not (SMTP_USER and SMTP_PASS and NOTIFY_EMAIL):
+        return False
+    import smtplib
+    from email.message import EmailMessage
+    try:
+        msg = EmailMessage()
+        msg["Subject"] = titel
+        msg["From"]    = SMTP_USER
+        msg["To"]      = NOTIFY_EMAIL
+        msg.set_content(tekst)
+        with smtplib.SMTP_SSL("smtp.gmail.com", 465, timeout=25) as s:
+            s.login(SMTP_USER, SMTP_PASS)
+            s.send_message(msg)
+        return True
+    except Exception as e:
+        log(f"[MAIL] fout: {e}")
+        return False
+
+
+def stuur_bericht(titel: str, body: str) -> bool:
+    """
+    Stuur een notificatie via het eerst-beschikbare kanaal:
+    WhatsApp (CallMeBot) -> e-mail -> log. NOTIFY_DRYRUN logt alleen.
+    """
+    volledig = f"*{titel}*\n{body}" if titel else body
+    if NOTIFY_DRYRUN:
+        log(f"[NOTIFY dry-run]\n{volledig}")
+        return True
+    if _send_callmebot(volledig):
+        log(f"[NOTIFY] WhatsApp verstuurd: {titel}")
+        return True
+    if _send_email(titel, body):
+        log(f"[NOTIFY] E-mail verstuurd: {titel}")
+        return True
+    log(f"[NOTIFY] Geen kanaal geconfigureerd; niet verstuurd: {titel}")
+    return False
+
+
+# ── Pre-match notificaties ──────────────────────────────────────────────────
+
+def _odds_trajectorie(conn, wid: str):
+    """
+    Geef (tijden, dict[uitkomst] -> [odd_t0, odd_mid, odd_now]) terug.
+    Drie ijkpunten op de aggregaat-reeks: eerste scrape, middelste, laatste.
+    """
+    tijden = None
+    traj: dict[str, Optional[list]] = {}
+    for uitkomst in ("thuis", "gelijkspel", "uit"):
+        rows = conn.execute(
+            "SELECT timestamp, median_odd FROM aggregated_snapshots "
+            "WHERE wedstrijd_id = ? AND uitkomst = ? ORDER BY timestamp ASC",
+            (wid, uitkomst)
+        ).fetchall()
+        if not rows:
+            traj[uitkomst] = None
+            continue
+        n = len(rows)
+        idx = (0, n // 2, n - 1)
+        traj[uitkomst] = [rows[i][1] for i in idx]
+        if tijden is None:
+            tijden = [_parse_iso(rows[i][0]) for i in idx]
+    return tijden, traj
+
+
+def _ascii_odds_tabel(conn, wid: str) -> str:
+    """ASCII-tabel (monospace) van het odds-verloop op t0 / midden / nu."""
+    tijden, traj = _odds_trajectorie(conn, wid)
+    if not tijden:
+        return ""
+
+    def rij(label, a, b, c):
+        return f"{label:<3}{a:>7}{b:>7}{c:>7}"
+
+    regels = [rij("", "t0", "mid", "now")]
+    for code, uitkomst in (("1", "thuis"), ("X", "gelijkspel"), ("2", "uit")):
+        vals = traj.get(uitkomst)
+        if not vals:
+            regels.append(rij(code, "-", "-", "-"))
+        else:
+            regels.append(rij(code, f"{vals[0]:.2f}", f"{vals[1]:.2f}", f"{vals[2]:.2f}"))
+
+    def kort(dt):
+        return dt.strftime("%m-%d %Hh")
+
+    legenda = f"t0={kort(tijden[0])}  mid={kort(tijden[1])}  now={kort(tijden[2])}"
+    # Triple-backticks -> WhatsApp rendert dit als monospace zodat de
+    # kolommen netjes uitlijnen.
+    return "```\n" + "\n".join(regels) + "\n```\n" + legenda
+
+
+def bouw_prematch_samenvatting(conn, wid: str, thuis: str, uit: str,
+                               aanvang_iso: str) -> str:
+    """Korte data-samenvatting van een wedstrijd voor de pre-match alert."""
+    aanvang = _parse_iso(aanvang_iso)
+    uren = (aanvang - datetime.now(timezone.utc)).total_seconds() / 3600
+
+    bew = bereken_beweging_aggregated(conn, wid) or {}
+    n_row = conn.execute(
+        "SELECT n_bookmakers FROM aggregated_snapshots WHERE wedstrijd_id = ? "
+        "ORDER BY timestamp DESC LIMIT 1", (wid,)
+    ).fetchone()
+    n_books = n_row[0] if n_row else "?"
+
+    labels = {"thuis": f"1 {thuis}", "gelijkspel": "X gelijk", "uit": f"2 {uit}"}
+    regels = []
+    for uitkomst in ("thuis", "gelijkspel", "uit"):
+        d = bew.get(uitkomst)
+        if not d:
+            regels.append(f"  {labels[uitkomst]}: -")
+            continue
+        delta = d["huidige_prob"] - d["opening_prob"]
+        extra = f", laat {d['late_beweging']:+.1%}" if d.get("late_beweging") is not None else ""
+        regels.append(
+            f"  {labels[uitkomst]}: {d['huidige_odd']:.2f} "
+            f"({d['huidige_prob']:.0%}, dopen {delta:+.1%}{extra})"
+        )
+
+    bets_op_match = conn.execute(
+        "SELECT uitkomst, signaal_type, locked_odd, stake_compound, is_rebet "
+        "FROM bets WHERE wedstrijd_id = ? ORDER BY id", (wid,)
+    ).fetchall()
+    if bets_op_match:
+        bet_txt = "; ".join(
+            f"{'RE-BET' if rebet else 'BET'} {u} @ {odd} (EUR {stake:.2f}, {sig})"
+            for u, sig, odd, stake, rebet in bets_op_match
+        )
+    else:
+        bet_txt = "geen bet (geen signaal boven drempel)"
+
+    blokken = [
+        f"Aftrap: {_fmt_aanvang(aanvang_iso)} (over {uren:.1f}u)",
+        f"Odds (mediaan, {n_books} bookmakers):",
+        "\n".join(regels),
+    ]
+    tabel = _ascii_odds_tabel(conn, wid)
+    if tabel:
+        blokken.append("Verloop (mediaan-odd):\n" + tabel)
+    blokken.append(f"Bot: {bet_txt}")
+    return "\n".join(blokken)
+
+
+def verstuur_prematch_notificaties(conn) -> list[str]:
+    """Stuur 1 alert per wedstrijd waarvan de aftrap binnen LEAD-uur valt."""
+    now = datetime.now(timezone.utc)
+    grens = (now + timedelta(hours=PREMATCH_LEAD_HOURS)).isoformat()
+    rijen = conn.execute(
+        "SELECT id, thuisteam, uitteam, aanvang FROM wedstrijden "
+        "WHERE voltooid = 0 AND prematch_genotificeerd IS NULL "
+        "AND aanvang > ? AND aanvang <= ? ORDER BY aanvang",
+        (now.isoformat(), grens)
+    ).fetchall()
+
+    verstuurd = []
+    for wid, thuis, uit, aanvang in rijen:
+        body  = bouw_prematch_samenvatting(conn, wid, thuis, uit, aanvang)
+        if stuur_bericht(f"WK alert: {thuis} vs {uit}", body):
+            conn.execute(
+                "UPDATE wedstrijden SET prematch_genotificeerd = ? WHERE id = ?",
+                (_iso_now(), wid)
+            )
+            conn.commit()
+            verstuurd.append(f"{thuis} vs {uit}")
+    if verstuurd:
+        log(f"[PREMATCH] {len(verstuurd)} alert(s) verstuurd")
+    return verstuurd
+
+
 # ── Top-level commando's ────────────────────────────────────────────────────
 
-def cmd_scrape(conn):
+def cmd_scrape(conn, force: bool = False) -> bool:
+    """Voer een odds-scrape uit, tenzij de throttle hem overslaat."""
+    if not force:
+        doen, reden = moet_scrapen(conn)
+        log(f"[SCRAPE] {reden}")
+        if not doen:
+            return False
     data = haal_odds_op()
     ts = sla_odds_snapshot_op(conn, data)
     sla_aggregated_snapshot_op(conn, ts)
@@ -971,6 +1245,7 @@ def cmd_scrape(conn):
         (ts, "odds", "ok")
     )
     conn.commit()
+    return True
 
 
 def cmd_beslis(conn):
@@ -1007,22 +1282,33 @@ def cmd_daily_run(conn):
     log("=" * 50)
     log("[daily-run] Start cyclus")
 
+    gescraped = False
     try:
-        cmd_scrape(conn)
+        gescraped = cmd_scrape(conn)
     except Exception as e:
         log(f"[daily-run] FOUT in scrape: {e}")
 
-    try:
-        geplaatst = plaats_bets_voor_scrape(conn)
-        notificeer_nieuwe_bets(conn, geplaatst)
-    except Exception as e:
-        log(f"[daily-run] FOUT in beslis: {e}")
+    if gescraped:
+        try:
+            geplaatst = plaats_bets_voor_scrape(conn)
+            notificeer_nieuwe_bets(conn, geplaatst)
+        except Exception as e:
+            log(f"[daily-run] FOUT in beslis: {e}")
+    else:
+        log("[daily-run] Scrape overgeslagen (throttle) - geen nieuwe bet-evaluatie")
 
     try:
         settled = settle_voltooide_wedstrijden(conn)
         notificeer_settled_bets(conn, settled)
     except Exception as e:
         log(f"[daily-run] FOUT in settle: {e}")
+
+    # Pre-match alerts draaien ELKE run (los van de scrape-throttle) zodat de
+    # timing strak blijft, ook als de odds-scrape is overgeslagen.
+    try:
+        verstuur_prematch_notificaties(conn)
+    except Exception as e:
+        log(f"[daily-run] FOUT in prematch-notificaties: {e}")
 
     log(f"[daily-run] Bankroll compound: EUR {bankroll_compound_huidig(conn):.2f}")
     log("[daily-run] Klaar")
@@ -1036,8 +1322,11 @@ def main():
     parser.add_argument(
         "commando",
         choices=["daily-run", "scrape", "signalen", "beslis", "settle",
-                 "stats", "bankroll", "bets", "wedstrijden"]
+                 "stats", "bankroll", "bets", "wedstrijden",
+                 "prematch", "notify-test"]
     )
+    parser.add_argument("--force", action="store_true",
+                        help="Negeer de scrape-throttle (alleen bij 'scrape')")
     args = parser.parse_args()
 
     conn = sqlite3.connect(DB_PATH)
@@ -1048,7 +1337,17 @@ def main():
         if args.commando == "daily-run":
             cmd_daily_run(conn)
         elif args.commando == "scrape":
-            cmd_scrape(conn)
+            if cmd_scrape(conn, force=args.force) is False:
+                print("Scrape overgeslagen door throttle (gebruik --force om te forceren).")
+        elif args.commando == "prematch":
+            verstuurd = verstuur_prematch_notificaties(conn)
+            print(f"{len(verstuurd)} pre-match alert(s) verstuurd."
+                  if verstuurd else "Geen wedstrijden binnen het alert-venster.")
+        elif args.commando == "notify-test":
+            ok = stuur_bericht("WK2026 testbericht",
+                               "Als je dit ziet werkt je notificatiekanaal. ✅")
+            print("Testbericht verstuurd." if ok else
+                  "Geen kanaal geconfigureerd (zet CALLMEBOT_* of SMTP_* of WK2026_NOTIFY_DRYRUN=1).")
         elif args.commando == "signalen":
             cmd_signalen(conn)
         elif args.commando == "beslis":

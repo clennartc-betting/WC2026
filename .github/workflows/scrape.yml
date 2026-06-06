@@ -1,12 +1,15 @@
 name: WK 2026 Bet Cycle
 
-# Draait elke 6 uur en kan handmatig vanuit de GitHub UI worden gestart.
-# Persistente data (wk2026.db) leeft op de `data` branch en wordt elke
-# run gerestored en weer teruggepusht.
+# Draait elke 2 uur (op een 'oneven' minuut, want het hele uur is het
+# drukst en wordt door GitHub vaker overgeslagen/uitgesteld). Het script
+# beslist zelf via een throttle of het echt de Odds API aanroept, dus
+# vaak draaien kost geen extra credits maar maakt het robuust tegen
+# overgeslagen cron-slots. Pre-match alerts draaien elke run.
+# Persistente data (wk2026.db) leeft op de `data` branch.
 
 on:
   schedule:
-    - cron: '0 */6 * * *'
+    - cron: '37 */2 * * *'
   workflow_dispatch:
 
 # Voorkom dat twee runs tegelijk op de DB schrijven.
@@ -47,9 +50,16 @@ jobs:
 
       - name: Run daily-run cycle
         env:
-          ODDS_API_KEY:  ${{ secrets.ODDS_API_KEY }}
-          GH_TOKEN:      ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO:       ${{ github.repository }}
+          ODDS_API_KEY:     ${{ secrets.ODDS_API_KEY }}
+          GH_TOKEN:         ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO:          ${{ github.repository }}
+          # Pre-match notificaties (WhatsApp via CallMeBot). Leeg = uit.
+          CALLMEBOT_PHONE:  ${{ secrets.CALLMEBOT_PHONE }}
+          CALLMEBOT_APIKEY: ${{ secrets.CALLMEBOT_APIKEY }}
+          # Optionele e-mail fallback (Gmail app password).
+          SMTP_USER:        ${{ secrets.SMTP_USER }}
+          SMTP_PASS:        ${{ secrets.SMTP_PASS }}
+          NOTIFY_EMAIL:     ${{ secrets.NOTIFY_EMAIL }}
         run: python wk2026_tracker.py daily-run
 
       - name: Push updated DB to `data` branch

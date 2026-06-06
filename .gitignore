@@ -22,6 +22,10 @@ wk2026.db-journal
 tracker.log
 *.log
 
+# Dashboard temp/artefacten
+err.txt
+.streamlit/
+
 # OS / editor rommel
 .DS_Store
 Thumbs.db

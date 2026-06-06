@@ -1,0 +1,10 @@
+# Dependencies voor het lokale dashboard (dashboard.py).
+# Los van requirements.txt zodat de GitHub Actions runner deze NIET
+# hoeft te installeren — het dashboard draait alleen lokaal op je laptop.
+#
+#   pip install -r requirements-dashboard.txt
+#   streamlit run dashboard.py
+
+streamlit>=1.40,<2
+plotly>=5.20
+pandas>=2.0

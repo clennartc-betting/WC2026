@@ -2,7 +2,7 @@
   WK 2026 BET-SIMULATIE PROJECT - PROJECTNOTITIES
 ================================================================================
 
-Laatst bijgewerkt: 2026-05-28
+Laatst bijgewerkt: 2026-06-06  (scrape-throttle + pre-match WhatsApp alerts)
 
 
 --------------------------------------------------------------------------------
@@ -99,8 +99,10 @@ Re-bets ("middelen" op dezelfde edge als de beweging doorzet):
 --------------------------------------------------------------------------------
 
   gok_projectje/
-  +-- wk2026_tracker.py         <-- alle logica (single-file)
-  +-- requirements.txt          <-- `requests`
+  +-- wk2026_tracker.py         <-- alle bot-logica (single-file)
+  +-- dashboard.py              <-- lokaal Streamlit-dashboard (leest db)
+  +-- requirements.txt          <-- `requests` (voor de bot / Actions)
+  +-- requirements-dashboard.txt<-- streamlit/plotly/pandas (alleen lokaal)
   +-- .gitignore                <-- ignoreert .env, lokale db, __pycache__
   +-- .env.example              <-- template voor lokale env vars
   +-- projectnotes.txt          <-- DIT bestand
@@ -160,6 +162,46 @@ Eens per 6 uur triggert GitHub Actions de volgende keten:
 
 
 --------------------------------------------------------------------------------
+4B. SCHEDULING-BETROUWBAARHEID (waarom elke 2u + self-throttle)
+--------------------------------------------------------------------------------
+
+PROBLEEM (waargenomen 2026-06-06):
+  De cron stond op '0 */6 * * *' (4x/dag). In de praktijk vuurde GitHub
+  maar ~2x/dag, met vertragingen tot 6u en gaten tot ~20u. ALLE runs
+  slaagden (geen fouten) - GitHub SLOEG scheduled slots simpelweg OVER.
+  Dit is bekend, gedocumenteerd gedrag van GitHub Actions 'schedule' op
+  de gratis tier, vooral op het hele uur (minuut :00 is het drukst).
+
+OPLOSSING (twee delen):
+  1) Over-schedulen: cron staat nu op '37 */2 * * *' = elke 2u op een
+     'oneven' minuut (12 pogingen/dag i.p.v. 4). Meer pogingen = grotere
+     kans dat er genoeg landen, ook als GitHub er veel overslaat.
+  2) Self-throttle in het script (functie moet_scrapen): bij ELKE run
+     beslist het script of het ECHT de Odds API aanroept, op basis van
+     tijd sinds de laatste succesvolle scrape:
+        - normaal:     minimaal WK2026_MIN_SCRAPE_GAP_HOURS (3.5u) ertussen
+        - boost:       valt de eerstvolgende aftrap binnen
+                       WK2026_SCRAPE_BOOST_WINDOW_HOURS (6u), dan mag het
+                       elke WK2026_MIN_SCRAPE_GAP_BOOST_HOURS (1.5u).
+     Zo blijft het credit-verbruik begrensd, ongeacht hoe vaak de
+     workflow draait, EN krijgen we dichte datapunten vlak voor aftrap
+     (nodig voor het 'laat_publiek' signaal).
+
+GEVOLG VOOR DE FLOW:
+  - Bet-evaluatie draait alleen als er ECHT gescraped is (nieuwe data).
+  - Settlement (scores) en pre-match alerts draaien ELKE run, los van de
+    scrape-throttle, zodat timing strak blijft.
+
+WAT ALS HET NOG STEEDS TE WEINIG IS?
+  GitHub kan ook elke-2u-slots overslaan. Mocht je echt strakke cadans
+  willen, dan is de robuustste optie een EXTERNE trigger (bv. het gratis
+  cron-job.org dat elke X min de 'workflow_dispatch' via de GitHub API
+  aanroept). Niet ingebouwd; de over-schedule + throttle is voor dit
+  hobby-doel ruim voldoende en voegt geen externe afhankelijkheid toe.
+
+
+
+--------------------------------------------------------------------------------
 5. DATABASE-SCHEMA (SQLite, file: wk2026.db)
 --------------------------------------------------------------------------------
 
@@ -174,6 +216,7 @@ Eens per 6 uur triggert GitHub Actions de volgende keten:
     winnaar         TEXT  ('thuis'/'gelijkspel'/'uit')
     afgewikkeld_op  TEXT
     gh_issue_number INT   (GitHub Issue nummer voor deze match)
+    prematch_genotificeerd TEXT  (timestamp; NULL = nog geen alert gestuurd)
 
   odds_snapshots         <-- één rij per (scrape, bookmaker, uitkomst)
     id              INT PK
@@ -258,6 +301,17 @@ Eens per 6 uur triggert GitHub Actions de volgende keten:
   python wk2026_tracker.py wedstrijden
       Lijst van aankomende wedstrijden uit de DB.
 
+  python wk2026_tracker.py scrape --force
+      Forceer een scrape en negeer de throttle (zie sectie 4B).
+
+  python wk2026_tracker.py prematch
+      Controleer of er wedstrijden binnen het alert-venster vallen en
+      stuur (eenmalig per wedstrijd) een pre-match notificatie.
+
+  python wk2026_tracker.py notify-test
+      Stuur een testbericht via je notificatiekanaal (zie sectie 10).
+      Tip: zet WK2026_NOTIFY_DRYRUN=1 om alleen te loggen zonder te sturen.
+
 
 
 --------------------------------------------------------------------------------
@@ -286,6 +340,13 @@ Eens per 6 uur triggert GitHub Actions de volgende keten:
           De Actions workflow gebruikt automatisch ${{ secrets.GITHUB_TOKEN }}
           voor Issues; daar hoef je niets voor te doen.
 
+          Voor pre-match WhatsApp-alerts (sectie 10), voeg ook toe:
+            Naam: CALLMEBOT_PHONE    Value: +31... (je eigen nummer)
+            Naam: CALLMEBOT_APIKEY   Value: <key die CallMeBot je stuurt>
+          (Optionele e-mail fallback: SMTP_USER, SMTP_PASS, NOTIFY_EMAIL.)
+          Deze zijn optioneel; zonder deze secrets draait alles door,
+          alleen zonder pre-match alerts.
+
   STAP 4. (BELANGRIJK / VEILIGHEID)
           Je oude wk2026_tracker.py had een hardcoded API key in de
           source. Die is verwijderd in de nieuwe versie. ALS die key
@@ -308,6 +369,52 @@ Eens per 6 uur triggert GitHub Actions de volgende keten:
               de GitHub UI of `git fetch origin data && git checkout
               data -- wk2026.db` lokaal).
 
+
+
+--------------------------------------------------------------------------------
+7B. DASHBOARD (dashboard.py) - LOKAAL BEKIJKEN
+--------------------------------------------------------------------------------
+
+`dashboard.py` is een interactief Streamlit-dashboard dat puur de lokale
+`wk2026.db` uitleest. Het roept NOOIT The Odds API of welke externe dienst
+dan ook aan - het toont alleen wat de bot al heeft verzameld. De signaal-
+en Kelly-berekeningen in het dashboard spiegelen exact die in
+`wk2026_tracker.py`, zodat wat je ziet overeenkomt met wat de bot doet.
+
+Eenmalig installeren:
+    pip install -r requirements-dashboard.txt
+
+Starten (download eerst de actuele db vanaf de `data` branch, zie sectie 7
+stap 6, en zet hem in deze map als wk2026.db):
+    streamlit run dashboard.py
+    -> opent automatisch in je browser op http://localhost:8501
+    -> stoppen: Ctrl+C in de terminal
+
+Andere database tonen:
+    WK2026_DB=pad/naar/andere.db streamlit run dashboard.py
+
+Vijf tabbladen:
+  1. Signalen      - Welke wedstrijd/uitkomst zit het dichtst bij het
+                     triggeren van een bet? Gesorteerd op "afstand" tot de
+                     drempel. Toont actieve signalen (indien aanwezig) en
+                     een staafdiagram van de grootste bewegingen.
+  2. Odds-beweging - Kies een wedstrijd; zie de mediaan implied probability
+                     (of decimal odd) van thuis/gelijk/uit over tijd, met
+                     verticale markers op aftrap, -48u en -6u. Daaronder de
+                     vroege/late beweging per uitkomst.
+  3. Bets & bankroll - Tabel van alle (virtuele) bets + bankroll-curve zodra
+                     er gesettelde bets zijn. Nu nog leeg (geen bets).
+  4. Schema        - Volledig wedstrijdschema met status en (later) uitslag.
+  5. Data & API    - Scrape-cadans per dag (doel 4/dag), aantal rijen,
+                     gemiddeld aantal bookmakers, en de api_runs-log.
+
+Top-balk toont altijd: bankroll, aantal bets, win-rate, ROI, aantal
+wedstrijden en aantal scrapes. De "Ververs data"-knop in de zijbalk leegt
+de cache en herleest de db (handig na het downloaden van een nieuwe versie).
+
+De cache invalideert automatisch op de wijzigingstijd (mtime) van het
+db-bestand, dus na het vervangen van wk2026.db pakt het dashboard de
+nieuwe data bij de volgende rerun.
 
 
 --------------------------------------------------------------------------------
@@ -335,6 +442,15 @@ Eens per 6 uur triggert GitHub Actions de volgende keten:
   WK2026_MAX_BET_FRACTIE     0.05                          5% max per bet
   GH_TOKEN                   (auto in Actions)             Voor Issues
   GH_REPO                    (auto in Actions)             owner/repo
+  WK2026_MIN_SCRAPE_GAP_HOURS      3.5                     Min. uren tussen scrapes (normaal)
+  WK2026_SCRAPE_BOOST_WINDOW_HOURS 6                       Aftrap-nabijheid voor boost
+  WK2026_MIN_SCRAPE_GAP_BOOST_HOURS 1.5                    Min. uren tussen scrapes (boost)
+  WK2026_PREMATCH_LEAD_HOURS       3                       Hoe vroeg pre-match alert
+  CALLMEBOT_PHONE            (secret)                      Jouw WhatsApp-nummer
+  CALLMEBOT_APIKEY           (secret)                      CallMeBot key
+  SMTP_USER / SMTP_PASS      (secret)                      Gmail fallback
+  NOTIFY_EMAIL               (secret)                      Ontvanger e-mail
+  WK2026_NOTIFY_DRYRUN       (leeg)                        '1' = log i.p.v. sturen
 
 
 
@@ -342,28 +458,97 @@ Eens per 6 uur triggert GitHub Actions de volgende keten:
 9. API BUDGET (The Odds API free tier = 500 credits/maand)
 --------------------------------------------------------------------------------
 
+  Sinds 2026-06-06 vuurt de workflow ELKE 2 UUR, maar het script throttelt
+  zelf (sectie 4B). De workflow-frequentie bepaalt dus NIET het credit-
+  verbruik; de throttle-gap doet dat.
+
   /odds endpoint
       Kost = aantal_markets * aantal_regio's = 1 * 2 = 2 credits per call.
-      4 calls per dag * 30 dagen = 240 credits/maand.
+      Bij MIN_SCRAPE_GAP_HOURS=3.5 -> ~6 echte scrapes/dag (normaal),
+      plus extra in het boost-venster vlak voor aftrappen.
+      Grove schatting: ~6-9 scrapes/dag * 2 = ~12-18 credits/dag
+      -> ~360-540 credits/maand. LET OP: dit kan in een drukke
+      groepsfase tegen de 500 aanlopen.
 
   /scores endpoint
-      Kost = 2 met daysFrom (we gebruiken daysFrom=3).
-      Smart-skip: we callen /scores ALLEEN als er een open bet is op een
-      wedstrijd die minstens 2 uur geleden is gestart. Tijdens de groepsfase
-      betekent dat hooguit 1-2 calls per dag - geschat ~60-120 credits/maand.
+      Smart-skip: alleen als er een open bet is op een wedstrijd die >2u
+      geleden begon. Geschat ~30-120 credits/maand.
 
-  Totaal verwacht  : ~300-360 credits/maand. Ruime marge onder de 500.
-
-  Als je tegen het plafond aanloopt:
-    - Verlaag scrape-frequentie naar elke 8u of 12u (cron in scrape.yml).
-    - Beperk REGIO tot 'eu' (1 credit/odds-call -> 120/maand).
+  Als je tegen het plafond aanloopt (check de api_runs-tabel / dashboard):
+    - Verhoog WK2026_MIN_SCRAPE_GAP_HOURS (bv. 5) -> minder scrapes.
+    - Verklein WK2026_SCRAPE_BOOST_WINDOW_HOURS of verhoog de boost-gap.
+    - Beperk REGIO tot 'eu' (1 credit/odds-call -> halveert verbruik).
     - Of upgrade naar betaald plan ($30/maand voor 20k credits).
 
+  Spanning om bewust van te zijn: het 'laat_publiek' signaal heeft >=2
+  snapshots nodig in de laatste 6u voor aftrap. Daarom de boost. Een
+  ruime boost = beter signaal maar meer credits. Tune naar je budget.
+
 
 
 --------------------------------------------------------------------------------
-10. NOTIFICATIES (GitHub Issues)
+10. NOTIFICATIES
 --------------------------------------------------------------------------------
+
+Er zijn TWEE notificatiekanalen, voor verschillende doelen:
+
+  (A) Pre-match WhatsApp-alerts  -> jouw telefoon, vlak voor elke aftrap
+  (B) GitHub Issues              -> bet-administratie & resultaten
+
+----- (A) PRE-MATCH WHATSAPP (via CallMeBot) -----
+
+Doel: voor ELKE wedstrijd, kort voor aftrap, een samenvatting op je
+telefoon. Eenmalig per wedstrijd (dedupe via kolom prematch_genotificeerd).
+
+Setup (gratis, ~2 min):
+  1. Sla +34 611 04 87 48 op als contact (CallMeBot).
+  2. Stuur die contact in WhatsApp exact:
+        I allow callmebot to send me messages
+  3. Je krijgt binnen ~2 min een apikey terug.
+  4. Zet in GitHub repo-secrets:
+        CALLMEBOT_PHONE  = je eigen nummer met landcode (+31...)
+        CALLMEBOT_APIKEY = de ontvangen key
+  5. Test:  WK2026_NOTIFY_DRYRUN=1 python wk2026_tracker.py notify-test
+            (logt alleen) of zonder dryrun voor een echt testbericht.
+
+Timing: een alert gaat uit zodra de aftrap binnen PREMATCH_LEAD_HOURS (3u)
+valt. Met runs elke 2u krijg je hem dus ~1-3u voor aftrap. Wil je meer
+marge tegen overgeslagen runs? Verhoog LEAD (bv. 6), dan komt de alert
+eerder maar mis je hem zekerder niet.
+
+Timing: zie ook de uitleg onderaan deze sectie.
+
+Voorbeeld-bericht (de tabel staat in WhatsApp-monospace via ``` fences,
+zodat de kolommen uitlijnen op je telefoon):
+   *WK alert: Ivory Coast vs Ecuador*
+   Aftrap: 2026-06-14 23:00 UTC (over 2.5u)
+   Odds (mediaan, 37 bookmakers):
+     1 Ivory Coast: 3.63 (28%, dopen -1.4%)
+     X gelijk: 2.84 (35%, dopen +2.1%)
+     2 Ecuador: 2.35 (43%, dopen -1.3%)
+   Verloop (mediaan-odd):
+   ```
+           t0    mid    now
+   1     3.45   3.50   3.63
+   X     3.02   3.00   2.84
+   2     2.28   2.30   2.35
+   ```
+   t0=05-28 19h  mid=05-31 21h  now=06-05 18h
+   Bot: geen bet (geen signaal boven drempel)
+
+   (t0 = eerste scrape, mid = middelste scrape, now = laatste scrape.
+    1 = thuiswinst, X = gelijk, 2 = uitwinst.)
+
+WANNEER KRIJG JE HEM? De alert vuurt op de eerste run zodra de aftrap
+binnen PREMATCH_LEAD_HOURS (3u) valt. Met runs elke 2u is dat in de
+praktijk ~1-3u voor aftrap. Wil je meer marge tegen overgeslagen runs?
+Verhoog WK2026_PREMATCH_LEAD_HOURS (bv. 6 -> ~4-6u ervoor).
+
+Fallback: als CALLMEBOT_* leeg is maar SMTP_USER/SMTP_PASS/NOTIFY_EMAIL
+gezet zijn, gaat de alert via e-mail (Gmail app password). Is niets gezet,
+dan logt het script alleen (geen crash).
+
+----- (B) GITHUB ISSUES -----
 
 Eén issue per wedstrijd zodra de eerste bet wordt geplaatst:
 
@@ -480,8 +665,9 @@ zijn eigen kopie vanaf branch `data`.
    - Sharpe-ratio en variance metrics in `stats` (nu alleen ROI,
      win-rate, drawdown).
 
-   - Slack / Telegram / email notificaties als alternatief voor
-     Issues (vereist extra secrets en infrastructuur, geskipt voor nu).
+   - (GEDAAN 2026-06-06) Pre-match WhatsApp-alerts via CallMeBot +
+     e-mail fallback. Zie sectie 10. Telegram/Slack zou analoog kunnen
+     via dezelfde stuur_bericht()-dispatcher.
 
    - Adaptieve drempels: i.p.v. een statische 6% / 12% drempel,
      drempels die zich aanpassen aan de algemene volatiliteit
